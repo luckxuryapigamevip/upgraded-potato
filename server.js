@@ -13,12 +13,15 @@ const API_URL_MD5 = 'https://wtxmd52.tele68.com/v1/txmd5/sessions';
 const LEARNING_FILE = 'tiendat.json';
 const HISTORY_FILE = 'tiendat1.json';
 const DUDOAN_HISTORY_FILE = 'dudoan_history.json';
-const DATA_17K_FILE = 'data_17k.csv';
+const DATA_17K_FILE = 'data_sessions.csv';
+const PATTERN_CAU_FILE = 'cau.txt';
+const FORMULA_CAU_FILE = 'cong_thuc_cau.txt';
 const TRAINED_MODEL_FILE = 'trained_model_17k.json';
 
 const MAX_HISTORY = 100;
 const MAX_DUDOAN_HISTORY = 1000;
 const AUTO_SAVE_INTERVAL = 30000;
+const AUTHOR_ID = '@tranhoang2286';
 
 // ==================== STATE ====================
 let predictionHistory = { hu: [], md5: [] };
@@ -26,7 +29,6 @@ let dudoanHistory = { hu: [], md5: [] };
 let lastProcessedPhien = { hu: null, md5: null };
 let lastPattern10 = { hu: [], md5: [] };
 
-// Model đã học từ 17k phiên
 let trainedModel = {
   trained: false,
   trainStartTime: null,
@@ -35,6 +37,8 @@ let trainedModel = {
   markovChains: { 1: {}, 2: {}, 3: {}, 4: {}, 5: {}, 6: {}, 7: {}, 8: {}, 9: {} },
   frequencyData: {},
   patternLibrary: {},
+  patternDict: {},
+  formulaMap: {},
   taiPercent: 0,
   xiuPercent: 0,
   transitions: {},
@@ -74,7 +78,8 @@ const DEFAULT_PATTERN_WEIGHTS = {
   'break_streak': 1.0, 'alternating_break': 1.0,
   'double_pair_break': 1.0, 'triple_pattern': 1.0,
   'tong_phan_tich': 1.5, 'xu_huong_manh': 1.3, 'dao_chieu': 1.4,
-  'markov_chain': 1.2, 'frequency_analysis': 1.1
+  'markov_chain': 1.2, 'frequency_analysis': 1.1,
+  'pattern_dict': 1.8, 'formula_map': 1.6
 };
 
 // ==================== FILE I/O ====================
@@ -137,162 +142,128 @@ function savePredictionHistory() {
 
 // ==================== ĐỌC FILE 17K CSV ====================
 function parseCSVLine(line) {
-  // Format: dsid,result,dices,point,fetched_at
-  // result: TAI hoặc XIU
-  // dices: "[2, 2, 1]"
-  // point: 5
   const parts = [];
   let current = '';
   let inQuotes = false;
-  
   for (let i = 0; i < line.length; i++) {
     const char = line[i];
-    if (char === '"') {
-      inQuotes = !inQuotes;
-    } else if (char === ',' && !inQuotes) {
-      parts.push(current);
-      current = '';
-    } else {
-      current += char;
-    }
+    if (char === '"') inQuotes = !inQuotes;
+    else if (char === ',' && !inQuotes) { parts.push(current); current = ''; }
+    else current += char;
   }
   parts.push(current);
-  
   if (parts.length < 5) return null;
-  
   const dsid = parts[0].trim();
   const result = parts[1].trim();
   const dicesStr = parts[2].trim();
   const point = parseFloat(parts[3].trim());
-  const fetchedAt = parts[4].trim();
-  
   if (!dsid || !result) return null;
-  
   let dices = [0, 0, 0];
-  try {
-    dices = JSON.parse(dicesStr);
-  } catch (e) {
-    // Parse thủ công nếu cần
+  try { dices = JSON.parse(dicesStr); } catch (e) {
     const cleaned = dicesStr.replace(/[\[\]]/g, '');
     dices = cleaned.split(',').map(x => parseInt(x.trim()));
   }
-  
   return {
     Phien: parseInt(dsid),
     Ket_qua: result === 'TAI' ? 'Tài' : 'Xỉu',
-    Xuc_xac_1: dices[0] || 0,
-    Xuc_xac_2: dices[1] || 0,
-    Xuc_xac_3: dices[2] || 0,
-    Tong: point || (dices[0] + dices[1] + dices[2]),
-    Result: result,
-    fetchedAt
+    Xuc_xac_1: dices[0] || 0, Xuc_xac_2: dices[1] || 0, Xuc_xac_3: dices[2] || 0,
+    Tong: point || (dices[0] + dices[1] + dices[2])
   };
+}
+
+async function loadPatternCau() {
+  if (!fs.existsSync(PATTERN_CAU_FILE)) return;
+  console.log(`📖 Học 10k cầu từ ${PATTERN_CAU_FILE}...`);
+  const rl = readline.createInterface({ input: fs.createReadStream(PATTERN_CAU_FILE), crlfDelay: Infinity });
+  let count = 0;
+  for await (const line of rl) {
+    const match = line.match(/([TX]+)\s*-\s*([TX])/);
+    if (match && match[1].length === 14) {
+      trainedModel.patternDict[match[1].trim()] = match[2].trim();
+      count++;
+    }
+  }
+  console.log(`✅ Đã học ${count} patterns từ cau.txt`);
+}
+
+async function loadFormulaCau() {
+  if (!fs.existsSync(FORMULA_CAU_FILE)) return;
+  console.log(`📖 Học bảng quy đổi từ ${FORMULA_CAU_FILE}...`);
+  const lines = fs.readFileSync(FORMULA_CAU_FILE, 'utf8').split('\n');
+  let count = 0;
+  for (const line of lines) {
+    if (line.includes('=')) {
+      const parts = line.split('=').map(s => s.trim());
+      if (parts.length === 2) {
+        if (!trainedModel.formulaMap[parts[0]]) trainedModel.formulaMap[parts[0]] = [];
+        if (!trainedModel.formulaMap[parts[1]]) trainedModel.formulaMap[parts[1]] = [];
+        if (!trainedModel.formulaMap[parts[0]].includes(parts[1])) trainedModel.formulaMap[parts[0]].push(parts[1]);
+        if (!trainedModel.formulaMap[parts[1]].includes(parts[0])) trainedModel.formulaMap[parts[1]].push(parts[0]);
+        count++;
+      }
+    }
+  }
+  console.log(`✅ Đã học ${count} công thức quy đổi cầu`);
 }
 
 async function loadAndTrainFromCSV() {
   console.log('\n📚 === BẮT ĐẦU HỌC 17K PHIÊN ===');
   trainedModel.trainStartTime = new Date().toISOString();
-  
   if (!fs.existsSync(DATA_17K_FILE)) {
-    console.log('⚠️  Không tìm thấy data_17k.csv - Bỏ qua training');
+    console.log('⚠️  Không tìm thấy data_sessions.csv - Bỏ qua training');
     trainedModel.trained = false;
     return false;
   }
-  
   try {
     const fileStream = fs.createReadStream(DATA_17K_FILE);
     const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
-    
     let allSessions = [];
     let lineNum = 0;
     let headerSkipped = false;
-    
     for await (const line of rl) {
       lineNum++;
       if (!line.trim()) continue;
-      
-      // Skip header
-      if (!headerSkipped && line.toLowerCase().includes('dsid')) {
-        headerSkipped = true;
-        continue;
-      }
+      if (!headerSkipped && line.toLowerCase().includes('dsid')) { headerSkipped = true; continue; }
       headerSkipped = true;
-      
       const parsed = parseCSVLine(line);
-      if (parsed) {
-        allSessions.push(parsed);
-      }
-      
-      if (lineNum % 1000 === 0) {
-        console.log(`   📖 Đã đọc ${lineNum} dòng...`);
-      }
+      if (parsed) allSessions.push(parsed);
+      if (lineNum % 1000 === 0) console.log(`   📖 Đã đọc ${lineNum} dòng...`);
     }
-    
     console.log(`✅ Đã đọc ${allSessions.length} phiên từ CSV`);
-    
-    // Sắp xếp theo phiên (mới nhất trước)
     allSessions.sort((a, b) => b.Phien - a.Phien);
-    
-    // Build Markov chains bậc 1-9
     const results = allSessions.map(s => s.Ket_qua);
     console.log(`🔗 Building Markov Chains bậc 1-9...`);
     for (let order = 1; order <= 9; order++) {
       trainedModel.markovChains[order] = buildMarkovChainFromArray(results, order);
       console.log(`   ✅ Markov bậc ${order}: ${Object.keys(trainedModel.markovChains[order]).length} states`);
     }
-    
-    // Frequency Analysis
     console.log(`📊 Building Frequency Data...`);
     const totalTai = results.filter(r => r === 'Tài').length;
     trainedModel.taiPercent = (totalTai / results.length * 100);
     trainedModel.xiuPercent = 100 - trainedModel.taiPercent;
-    
-    // Windows
     [10, 20, 50, 100, 500, 1000].forEach(w => {
       if (results.length >= w) {
         const win = results.slice(0, w);
         const t = win.filter(r => r === 'Tài').length;
         trainedModel.frequencyData[`window_${w}`] = {
-          tai: t, xiu: w - t,
-          taiPercent: t / w * 100, xiuPercent: (w - t) / w * 100
+          tai: t, xiu: w - t, taiPercent: t / w * 100, xiuPercent: (w - t) / w * 100
         };
       }
     });
     console.log(`   ✅ T:${trainedModel.taiPercent.toFixed(2)}% - X:${trainedModel.xiuPercent.toFixed(2)}%`);
-    
-    // Build transitions
     console.log(`🔄 Building Transitions...`);
     const transitions = { 'Tài': { 'Tài': 0, 'Xỉu': 0 }, 'Xỉu': { 'Tài': 0, 'Xỉu': 0 } };
-    for (let i = 0; i < results.length - 1; i++) {
-      transitions[results[i]][results[i+1]]++;
-    }
+    for (let i = 0; i < results.length - 1; i++) transitions[results[i]][results[i+1]]++;
     trainedModel.transitions = transitions;
-    console.log(`   ✅ T→T: ${transitions['Tài']['Tài']}, T→X: ${transitions['Tài']['Xỉu']}, X→T: ${transitions['Xỉu']['Tài']}, X→X: ${transitions['Xỉu']['Xỉu']}`);
-    
-    // Pattern library
     console.log(`🎯 Building Pattern Library...`);
     trainedModel.patternLibrary = buildPatternLibrary(results);
     console.log(`   ✅ ${Object.keys(trainedModel.patternLibrary).length} patterns detected`);
-    
-    // Lưu history cho reference
-    trainedModel.history = allSessions.slice(0, 1000).map(s => ({
-      Phien: s.Phien, Ket_qua: s.Ket_qua, Tong: s.Tong
-    }));
-    
+    trainedModel.history = allSessions.slice(0, 1000).map(s => ({ Phien: s.Phien, Ket_qua: s.Ket_qua, Tong: s.Tong }));
     trainedModel.totalSamples = allSessions.length;
     trainedModel.trained = true;
     trainedModel.trainEndTime = new Date().toISOString();
-    
-    // Save model
     fs.writeFileSync(TRAINED_MODEL_FILE, JSON.stringify(trainedModel, null, 2));
-    
-    console.log(`\n🎉 === HOÀN TẤT HỌC ${allSessions.length} PHIÊN ===`);
-    console.log(`   ⏱️  Time: ${new Date(trainedModel.trainEndTime) - new Date(trainedModel.trainStartTime)}ms`);
-    console.log(`   🧠 Markov bậc: 1-9 (${Object.keys(trainedModel.markovChains[1]).length} base states)`);
-    console.log(`   📊 Tài: ${trainedModel.taiPercent.toFixed(2)}% - Xỉu: ${trainedModel.xiuPercent.toFixed(2)}%`);
-    console.log(`   🎯 Patterns: ${Object.keys(trainedModel.patternLibrary).length}`);
-    console.log(`   💾 Saved: ${TRAINED_MODEL_FILE}\n`);
-    
+    console.log(`\n🎉 === HOÀN TẤT HỌC ${allSessions.length} PHIÊN ===\n`);
     return true;
   } catch (error) {
     console.error('❌ Error training from CSV:', error.message);
@@ -309,13 +280,10 @@ function loadTrainedModel() {
       console.log(`✅ Loaded trained model: ${trainedModel.totalSamples} samples`);
       return true;
     }
-  } catch (error) {
-    console.error('Error loading trained model:', error.message);
-  }
+  } catch (error) { console.error('Error loading trained model:', error.message); }
   return false;
 }
 
-// ==================== MARKOV CHAIN BUILDERS ====================
 function buildMarkovChainFromArray(results, order) {
   const chain = {};
   for (let i = 0; i <= results.length - order - 1; i++) {
@@ -330,30 +298,19 @@ function buildMarkovChainFromArray(results, order) {
 
 function predictMarkovFromModel(results, order) {
   const chain = trainedModel.markovChains[order];
-  if (!chain) return null;
-  if (results.length < order) return null;
-  
+  if (!chain || results.length < order) return null;
   const currentState = results.slice(0, order).map(r => r === 'Tài' ? 'T' : 'X').join('');
   const stateData = chain[currentState];
   if (!stateData || stateData.total < 3) return null;
-  
   const taiProb = stateData['Tài'] / stateData.total;
   const xiuProb = stateData['Xỉu'] / stateData.total;
   const confidence = Math.max(taiProb, xiuProb);
   if (confidence < 0.52) return null;
-  
-  return {
-    prediction: taiProb > xiuProb ? 'Tài' : 'Xỉu',
-    confidence: Math.round(confidence * 100),
-    order, state: currentState, samples: stateData.total
-  };
+  return { prediction: taiProb > xiuProb ? 'Tài' : 'Xỉu', confidence: Math.round(confidence * 100), order, state: currentState, samples: stateData.total };
 }
 
-// ==================== PATTERN LIBRARY ====================
 function buildPatternLibrary(results) {
   const library = {};
-  
-  // Count patterns of length 3-8
   for (let len = 3; len <= 8; len++) {
     const counts = {};
     for (let i = 0; i <= results.length - len - 1; i++) {
@@ -363,53 +320,52 @@ function buildPatternLibrary(results) {
       counts[pattern][next]++;
       counts[pattern].total++;
     }
-    // Only keep patterns with >= 20 occurrences
     const filtered = {};
-    Object.entries(counts).forEach(([k, v]) => {
-      if (v.total >= 20) filtered[k] = v;
-    });
+    Object.entries(counts).forEach(([k, v]) => { if (v.total >= 20) filtered[k] = v; });
     library[`len_${len}`] = filtered;
   }
-  
   return library;
 }
 
 function predictFromPatternLibrary(results) {
   if (!trainedModel.patternLibrary) return null;
-  
   const candidates = [];
-  
   for (let len = 3; len <= 8; len++) {
     const lib = trainedModel.patternLibrary[`len_${len}`];
-    if (!lib) continue;
-    if (results.length < len) continue;
-    
+    if (!lib || results.length < len) continue;
     const pattern = results.slice(0, len).map(r => r === 'Tài' ? 'T' : 'X').join('');
     const data = lib[pattern];
     if (!data || data.total < 10) continue;
-    
-    const taiProb = data['Tài'] / data.total;
-    const xiuProb = data['Xỉu'] / data.total;
+    const taiProb = data['Tài'] / data.total, xiuProb = data['Xỉu'] / data.total;
     const confidence = Math.max(taiProb, xiuProb);
-    
     if (confidence >= 0.55) {
-      candidates.push({
-        prediction: taiProb > xiuProb ? 'Tài' : 'Xỉu',
-        confidence: Math.round(confidence * 100),
-        pattern, len, samples: data.total,
-        priority: 5 + (len - 3)
-      });
+      candidates.push({ prediction: taiProb > xiuProb ? 'Tài' : 'Xỉu', confidence: Math.round(confidence * 100), pattern, len, samples: data.total, priority: 5 + (len - 3) });
     }
   }
-  
   if (candidates.length === 0) return null;
   candidates.sort((a, b) => b.confidence - a.confidence || b.samples - a.samples);
   const best = candidates[0];
-  return {
-    ...best,
-    name: `Pattern Library (${best.pattern} → ${best.prediction}, ${best.samples} samples)`,
-    patternId: 'markov_chain'
-  };
+  return { ...best, name: `Pattern Library (${best.pattern} → ${best.prediction}, ${best.samples} samples)`, patternId: 'markov_chain' };
+}
+
+function predictFromPatternDict(resultsArray) {
+  if (resultsArray.length < 14) return null;
+  const currentPattern = resultsArray.slice(0, 14).reverse().map(r => r === 'Tài' ? 'T' : 'X').join('');
+  if (trainedModel.patternDict && trainedModel.patternDict[currentPattern]) {
+    return { prediction: trainedModel.patternDict[currentPattern] === 'T' ? 'Tài' : 'Xỉu', confidence: 88, name: `Pattern Match (${currentPattern})`, patternId: 'pattern_dict' };
+  }
+  if (trainedModel.formulaMap) {
+    for (const [key, rels] of Object.entries(trainedModel.formulaMap)) {
+      if (currentPattern === key || currentPattern.includes(key)) {
+        for (const rel of rels) {
+          if (trainedModel.patternDict[rel]) {
+            return { prediction: trainedModel.patternDict[rel] === 'T' ? 'Tài' : 'Xỉu', confidence: 80, name: `Formula Match (${key} -> ${rel})`, patternId: 'formula_map' };
+          }
+        }
+      }
+    }
+  }
+  return null;
 }
 
 // ==================== PATTERN ANALYZERS ====================
@@ -419,9 +375,7 @@ function initializePatternStats(type) {
   }
   Object.keys(DEFAULT_PATTERN_WEIGHTS).forEach(pattern => {
     if (!learningData[type].patternStats[pattern]) {
-      learningData[type].patternStats[pattern] = {
-        total: 0, correct: 0, accuracy: 0.5, recentResults: [], lastAdjustment: null
-      };
+      learningData[type].patternStats[pattern] = { total: 0, correct: 0, accuracy: 0.5, recentResults: [], lastAdjustment: null };
     }
   });
 }
@@ -464,12 +418,7 @@ function analyzeCauBet(results, type) {
     if (streakLength >= 7) { shouldBreak = true; confidence = 85; }
     else if (streakLength >= 5) { shouldBreak = true; confidence = 75; }
     else if (streakLength >= 3) { shouldBreak = false; confidence = 68; }
-    return {
-      detected: true, type: streakType, length: streakLength,
-      prediction: shouldBreak ? (streakType === 'Tài' ? 'Xỉu' : 'Tài') : streakType,
-      confidence: Math.round(confidence * weight),
-      name: `Cầu Bệt ${streakLength} phiên ${streakType}`, patternId: 'cau_bet'
-    };
+    return { detected: true, type: streakType, length: streakLength, prediction: shouldBreak ? (streakType === 'Tài' ? 'Xỉu' : 'Tài') : streakType, confidence: Math.round(confidence * weight), name: `Cầu Bệt ${streakLength} phiên ${streakType}`, patternId: 'cau_bet' };
   }
   return { detected: false };
 }
@@ -483,12 +432,7 @@ function analyzeCauDao11(results, type) {
   }
   if (altLen >= 4) {
     const weight = getPatternWeight(type, 'cau_dao_11');
-    return {
-      detected: true, length: altLen,
-      prediction: results[0] === 'Tài' ? 'Xỉu' : 'Tài',
-      confidence: Math.round(Math.min(80, 65 + altLen * 2) * weight),
-      name: `Cầu Đảo 1-1 (${altLen} phiên)`, patternId: 'cau_dao_11'
-    };
+    return { detected: true, length: altLen, prediction: results[0] === 'Tài' ? 'Xỉu' : 'Tài', confidence: Math.round(Math.min(80, 65 + altLen * 2) * weight), name: `Cầu Đảo 1-1 (${altLen} phiên)`, patternId: 'cau_dao_11' };
   }
   return { detected: false };
 }
@@ -502,23 +446,14 @@ function analyzeCau22(results, type) {
   }
   if (pairCount >= 2) {
     let alt = true;
-    for (let j = 1; j < pattern.length; j++) {
-      if (pattern[j] === pattern[j - 1]) { alt = false; break; }
-    }
+    for (let j = 1; j < pattern.length; j++) if (pattern[j] === pattern[j - 1]) { alt = false; break; }
     if (alt) {
       const last = pattern[pattern.length - 1];
-      return {
-        detected: true, pairCount,
-        prediction: last === 'Tài' ? 'Xỉu' : 'Tài',
-        confidence: Math.round(Math.min(78, 65 + pairCount * 3) * getPatternWeight(type, 'cau_22')),
-        name: `Cầu 2-2 (${pairCount} cặp)`, patternId: 'cau_22'
-      };
+      return { detected: true, pairCount, prediction: last === 'Tài' ? 'Xỉu' : 'Tài', confidence: Math.round(Math.min(78, 65 + pairCount * 3) * getPatternWeight(type, 'cau_22')), name: `Cầu 2-2 (${pairCount} cặp)`, patternId: 'cau_22' };
     }
   }
   return { detected: false };
-}
-
-function analyzeCau33(results, type) {
+}function analyzeCau33(results, type) {
   if (results.length < 6) return { detected: false };
   let tc = 0, i = 0, pattern = [];
   while (i < results.length - 2) {
@@ -842,34 +777,34 @@ function calculateAdvancedPrediction(data, type) {
   
   let predictions = [], factors = [], allPatterns = [];
   
-  // ===== MARKOV FROM TRAINED MODEL (17K) =====
+  // ===== 1. PATTERN DICT (10K CẦU) - ƯU TIÊN SỐ 1 =====
+  const pd = predictFromPatternDict(results);
+  if (pd) {
+    predictions.push({ prediction: pd.prediction, confidence: pd.confidence, priority: 20, name: pd.name });
+    factors.push(pd.name);
+    allPatterns.push(pd);
+  }
+  
+  // ===== 2. MARKOV TỪ 17K =====
   if (trainedModel.trained) {
     for (let order = 1; order <= 9; order++) {
       const p = predictMarkovFromModel(results, order);
       if (p) {
         const name = `Markov Bậc ${order} (${p.state} → ${p.prediction}, ${p.samples} samples)`;
-        predictions.push({
-          prediction: p.prediction, confidence: p.confidence,
-          priority: 10 - order, name
-        });
+        predictions.push({ prediction: p.prediction, confidence: p.confidence, priority: 10 - order, name });
         factors.push(name);
         allPatterns.push({ ...p, name, patternId: 'markov_chain' });
       }
     }
-    
-    // Pattern Library from 17k
     const pl = predictFromPatternLibrary(results);
     if (pl) {
-      predictions.push({
-        prediction: pl.prediction, confidence: pl.confidence,
-        priority: pl.priority + 5, name: pl.name
-      });
+      predictions.push({ prediction: pl.prediction, confidence: pl.confidence, priority: pl.priority + 5, name: pl.name });
       factors.push(pl.name);
       allPatterns.push(pl);
     }
   }
   
-  // ===== FREQUENCY ANALYSIS =====
+  // ===== 3. FREQUENCY =====
   [10, 20, 50, 100].forEach(w => {
     if (results.length >= w) {
       const win = results.slice(0, w);
@@ -877,47 +812,42 @@ function calculateAdvancedPrediction(data, type) {
       const tp = tc / w * 100, xp = (w - tc) / w * 100;
       if (Math.abs(tp - xp) > 25) {
         const pred = tp < xp ? 'Tài' : 'Xỉu';
-        predictions.push({
-          prediction: pred, confidence: Math.round(Math.abs(tp - xp)),
-          priority: w === 50 ? 8 : (w === 100 ? 7 : 6),
-          name: `Frequency ${w} phiên (T:${tp.toFixed(0)}% X:${xp.toFixed(0)}%)`
-        });
+        predictions.push({ prediction: pred, confidence: Math.round(Math.abs(tp - xp)), priority: w === 50 ? 8 : (w === 100 ? 7 : 6), name: `Frequency ${w} phiên` });
         factors.push(`Frequency ${w} phiên`);
       }
     }
   });
   
-  // ===== BASIC PATTERNS =====
+  // ===== 4. CÁC PATTERN CƠ BẢN =====
   const analyzers = [
-    analyzeTongPhanTich(last50, type, 15),
-    analyzeXuHuongManh(results, type, 14),
-    analyzeDaoChieu(results, type, 13),
-    analyzeCauRong(results, type, 12),
-    analyzeBreakStreak(results, type, 11),
-    analyzeTriplePattern(results, type, 11),
-    analyzeDoublePairBreak(results, type, 10),
-    analyzeSmartBet(results, type, 10),
-    analyzeCauBet(results, type, 9),
-    analyzeCauDao11(results, type, 9),
-    analyzeCau22(results, type, 8),
-    analyzeCau33(results, type, 8),
-    analyzeCauBeCau(results, type, 8),
-    analyzeAlternatingBreak(results, type, 8),
-    analyzeCau121(results, type, 7),
-    analyzeCau123(results, type, 7),
-    analyzeCau321(results, type, 7),
-    analyzeCauNhipNghieng(results, type, 7),
-    analyzeCau3Van1(results, type, 6),
-    analyzeCauNhayCoc(results, type, 6)
+    analyzeTongPhanTich(last50, type),
+    analyzeXuHuongManh(results, type),
+    analyzeDaoChieu(results, type),
+    analyzeCauRong(results, type),
+    analyzeBreakStreak(results, type),
+    analyzeTriplePattern(results, type),
+    analyzeDoublePairBreak(results, type),
+    analyzeSmartBet(results, type),
+    analyzeCauBet(results, type),
+    analyzeCauDao11(results, type),
+    analyzeCau22(results, type),
+    analyzeCau33(results, type),
+    analyzeCauBeCau(results, type),
+    analyzeAlternatingBreak(results, type),
+    analyzeCau121(results, type),
+    analyzeCau123(results, type),
+    analyzeCau321(results, type),
+    analyzeCauNhipNghieng(results, type),
+    analyzeCau3Van1(results, type),
+    analyzeCauNhayCoc(results, type)
   ];
+  
+  const priorities = [15,14,13,12,11,11,10,10,9,9,8,8,8,8,7,7,7,7,6,6];
   
   analyzers.forEach((a, idx) => {
     if (a && a.detected) {
-      const priority = [15,14,13,12,11,11,10,10,9,9,8,8,8,8,7,7,7,7,6,6][idx] || 5;
-      predictions.push({
-        prediction: a.prediction, confidence: a.confidence,
-        priority, name: a.name
-      });
+      const priority = priorities[idx] || 5;
+      predictions.push({ prediction: a.prediction, confidence: a.confidence, priority, name: a.name });
       factors.push(a.name);
       allPatterns.push(a);
     }
@@ -927,18 +857,14 @@ function calculateAdvancedPrediction(data, type) {
   const dist = analyzeDistribution(last50, type);
   if (dist.imbalance > 0.15) {
     const minority = dist.taiPercent < 50 ? 'Tài' : 'Xỉu';
-    predictions.push({
-      prediction: minority, confidence: 65, priority: 5, name: 'Phân bố lệch'
-    });
+    predictions.push({ prediction: minority, confidence: 65, priority: 5, name: 'Phân bố lệch' });
     factors.push(`Phân bố (T:${dist.taiPercent.toFixed(0)}% X:${dist.xiuPercent.toFixed(0)}%)`);
   }
   
   // Fallback
   if (predictions.length === 0) {
     const f = analyzeCauTuNhien(results, type);
-    predictions.push({
-      prediction: f.prediction, confidence: f.confidence, priority: 1, name: f.name
-    });
+    predictions.push({ prediction: f.prediction, confidence: f.confidence, priority: 1, name: f.name });
     factors.push(f.name);
     allPatterns.push(f);
   }
@@ -958,13 +884,10 @@ function calculateAdvancedPrediction(data, type) {
   }
   
   let finalPrediction = taiScore >= xiuScore ? 'Tài' : 'Xỉu';
-  
-  // Smart reverse
   if (streak.currentStreak <= -4) {
     finalPrediction = finalPrediction === 'Tài' ? 'Xỉu' : 'Tài';
   }
   
-  // Confidence
   let baseConf = 65;
   predictions.slice(0, 3).forEach(p => {
     if (p.prediction === finalPrediction) baseConf += (p.confidence - 65) * 0.3;
@@ -1011,9 +934,7 @@ function getAdaptiveConfidenceBoost(type) {
   if (acc < 0.30) return -10;
   if (acc < 0.40) return -6;
   return 0;
-}
-
-// ==================== API DATA FETCH ====================
+}// ==================== API DATA FETCH ====================
 function transformApiData(apiData) {
   if (!apiData || !apiData.list || !Array.isArray(apiData.list)) return null;
   return apiData.list.map(item => ({
@@ -1133,7 +1054,8 @@ function getPatternIdFromName(name) {
     'Bẻ Chuỗi': 'break_streak', 'Bẻ Đảo': 'alternating_break',
     '3 Bộ Ba': 'triple_pattern', 'Cặp Đảo': 'double_pair_break',
     'Markov': 'markov_chain', 'Pattern Library': 'markov_chain',
-    'Frequency': 'frequency_analysis', 'Cầu Tự Nhiên': 'cau_tu_nhien'
+    'Frequency': 'frequency_analysis', 'Cầu Tự Nhiên': 'cau_tu_nhien',
+    'Pattern Match': 'pattern_dict', 'Formula Match': 'formula_map'
   };
   for (const [k, v] of Object.entries(m)) if (name.includes(k)) return v;
   return null;
@@ -1164,7 +1086,7 @@ function savePredictionToHistory(type, phien, prediction, confidence, latestData
     Do_tin_cay: `${confidence}%`,
     Phien_hien_tai: phien.toString(),
     Du_doan: prediction, ket_qua_du_doan: '',
-    id: '@tiendataox', timestamp: new Date().toISOString()
+    id: AUTHOR_ID, timestamp: new Date().toISOString()
   };
   predictionHistory[type].unshift(rec);
   if (predictionHistory[type].length > MAX_HISTORY)
@@ -1218,7 +1140,7 @@ function startAutoSaveTask() {
 // ==================== ENDPOINTS ====================
 app.get('/', (req, res) => {
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-  res.send(`🔥 Tài Xỉu VIP PRO ULTRA MAX 5.0 - 17K AI TRAINED
+  res.send(`🔥 Tài Xỉu VIP PRO ULTRA MAX 6.0 - 17K + 10K CAU
 📡 Endpoints:
   GET /api/tx              - Dự đoán Hũ (pattern_10)
   GET /api/tx/md5          - Dự đoán MD5 (pattern_10)
@@ -1227,12 +1149,15 @@ app.get('/', (req, res) => {
   GET /api/analysis        - Phân tích chi tiết
   GET /api/learning        - Stats AI
   GET /api/pattern10       - 10 cầu gần nhất
-  GET /api/training-status - Trạng thái học 17k
-  GET /retrain             - Force retrain 17k
+  GET /api/training-status - Trạng thái học
+  GET /retrain             - Force retrain
+  GET /reset-learning      - Reset learning
 
 🧠 Trained: ${trainedModel.trained ? '✅' : '❌'}
 📚 Samples: ${trainedModel.totalSamples}
-👤 @tiendataox`);
+🎯 Patterns: ${Object.keys(trainedModel.patternDict || {}).length}
+🔗 Formulas: ${Object.keys(trainedModel.formulaMap || {}).length}
+👤 ${AUTHOR_ID}`);
 });
 
 app.get('/api/tx', async (req, res) => {
@@ -1257,7 +1182,8 @@ app.get('/api/tx', async (req, res) => {
       pattern_10: lastPattern10.hu.join(''),
       ket_qua_du_doan: rec.ket_qua_du_doan || '',
       id: rec.id,
-      trained_on: trainedModel.trained ? `${trainedModel.totalSamples} samples` : 'not trained'
+      trained_on: trainedModel.trained ? `${trainedModel.totalSamples} samples` : 'not trained',
+      Phan_tich: result.factors
     });
   } catch (e) { console.error(e); res.status(500).json({ error: 'Lỗi server' }); }
 });
@@ -1284,7 +1210,8 @@ app.get('/api/tx/md5', async (req, res) => {
       pattern_10: lastPattern10.md5.join(''),
       ket_qua_du_doan: rec.ket_qua_du_doan || '',
       id: rec.id,
-      trained_on: trainedModel.trained ? `${trainedModel.totalSamples} samples` : 'not trained'
+      trained_on: trainedModel.trained ? `${trainedModel.totalSamples} samples` : 'not trained',
+      Phan_tich: result.factors
     });
   } catch (e) { console.error(e); res.status(500).json({ error: 'Lỗi server' }); }
 });
@@ -1345,7 +1272,8 @@ app.get('/api/learning', (req, res) => {
       taiPercent: trainedModel.taiPercent?.toFixed(2) + '%',
       xiuPercent: trainedModel.xiuPercent?.toFixed(2) + '%',
       markovOrders: Object.keys(trainedModel.markovChains || {}).length,
-      patternsCount: Object.keys(trainedModel.patternLibrary || {}).length
+      patternsCount: Object.keys(trainedModel.patternDict || {}).length,
+      formulasCount: Object.keys(trainedModel.formulaMap || {}).length
     },
     livePredictions: {
       total: stats.totalPredictions,
@@ -1386,9 +1314,8 @@ app.get('/api/training-status', (req, res) => {
       : {},
     frequencyData: trainedModel.frequencyData,
     transitions: trainedModel.transitions,
-    patternLibrarySizes: trainedModel.patternLibrary
-      ? Object.fromEntries(Object.entries(trainedModel.patternLibrary).map(([k, v]) => [k, Object.keys(v).length]))
-      : {},
+    patternDictSize: Object.keys(trainedModel.patternDict || {}).length,
+    formulaMapSize: Object.keys(trainedModel.formulaMap || {}).length,
     taiPercent: trainedModel.taiPercent,
     xiuPercent: trainedModel.xiuPercent
   });
@@ -1397,7 +1324,12 @@ app.get('/api/training-status', (req, res) => {
 app.get('/retrain', async (req, res) => {
   console.log('🔄 Force retrain từ CSV...');
   const success = await loadAndTrainFromCSV();
-  res.json({ success, totalSamples: trainedModel.totalSamples });
+  if (success) {
+    await loadPatternCau();
+    await loadFormulaCau();
+    fs.writeFileSync(TRAINED_MODEL_FILE, JSON.stringify(trainedModel));
+  }
+  res.json({ success, totalSamples: trainedModel.totalSamples, patterns: Object.keys(trainedModel.patternDict || {}).length });
 });
 
 app.get('/reset-learning', (req, res) => {
@@ -1413,16 +1345,26 @@ loadPredictionHistory();
 // Load trained model hoặc train from CSV
 if (loadTrainedModel()) {
   console.log('✅ Sử dụng model đã train');
+  // Đảm bảo nạp 10k cầu và công thức nếu thiếu
+  if (!trainedModel.patternDict || Object.keys(trainedModel.patternDict).length === 0) {
+    loadPatternCau().then(() => loadFormulaCau());
+  }
 } else {
   console.log('⚠️  Chưa có model. Bắt đầu train từ CSV...');
   loadAndTrainFromCSV().then(ok => {
-    if (!ok) console.log('⚠️  Không train được, dự đoán từ live data only');
+    if (ok) {
+      loadPatternCau().then(() => {
+        loadFormulaCau().then(() => {
+          fs.writeFileSync(TRAINED_MODEL_FILE, JSON.stringify(trainedModel));
+        });
+      });
+    }
   });
 }
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🚀 Server: http://0.0.0.0:${PORT}`);
-  console.log('🔥 Tài Xỉu VIP PRO ULTRA MAX 5.0 - 17K AI TRAINED');
+  console.log('🔥 Tài Xỉu VIP PRO ULTRA MAX 6.0 - 17K + 10K CẦU');
   console.log('');
   console.log('📡 ENDPOINTS:');
   console.log('  GET /api/tx              - Dự đoán Hũ (có pattern_10)');
@@ -1432,15 +1374,18 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log('  GET /api/analysis        - Phân tích chi tiết');
   console.log('  GET /api/learning        - Stats AI');
   console.log('  GET /api/pattern10       - 10 cầu gần nhất');
-  console.log('  GET /api/training-status - Trạng thái học 17k');
-  console.log('  GET /retrain             - Force retrain từ CSV');
+  console.log('  GET /api/training-status - Trạng thái học');
+  console.log('  GET /retrain             - Force retrain');
+  console.log('  GET /reset-learning      - Reset learning');
   console.log('');
   console.log(`🧠 TRAINED: ${trainedModel.trained ? '✅' : '❌'}`);
   console.log(`📚 SAMPLES: ${trainedModel.totalSamples}`);
+  console.log(`🎯 PATTERNS: ${Object.keys(trainedModel.patternDict || {}).length}`);
+  console.log(`🔗 FORMULAS: ${Object.keys(trainedModel.formulaMap || {}).length}`);
   console.log('');
   console.log('💾 FILES: tiendat.json, tiendat1.json, dudoan_history.json,');
-  console.log('           data_17k.csv, trained_model_17k.json');
-  console.log('👤 ID: @tiendataox\n');
+  console.log('           data_sessions.csv, cau.txt, cong_thuc_cau.txt, trained_model_17k.json');
+  console.log(`👤 ID: ${AUTHOR_ID}\n`);
   
   startAutoSaveTask();
 });
