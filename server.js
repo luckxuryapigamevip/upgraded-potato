@@ -453,7 +453,9 @@ function analyzeCau22(results, type) {
     }
   }
   return { detected: false };
-}function analyzeCau33(results, type) {
+}
+
+function analyzeCau33(results, type) {
   if (results.length < 6) return { detected: false };
   let tc = 0, i = 0, pattern = [];
   while (i < results.length - 2) {
@@ -777,7 +779,7 @@ function calculateAdvancedPrediction(data, type) {
   
   let predictions = [], factors = [], allPatterns = [];
   
-  // ===== 1. PATTERN DICT (10K CẦU) - ƯU TIÊN SỐ 1 =====
+  // 1. PATTERN DICT (10K CẦU)
   const pd = predictFromPatternDict(results);
   if (pd) {
     predictions.push({ prediction: pd.prediction, confidence: pd.confidence, priority: 20, name: pd.name });
@@ -785,7 +787,7 @@ function calculateAdvancedPrediction(data, type) {
     allPatterns.push(pd);
   }
   
-  // ===== 2. MARKOV TỪ 17K =====
+  // 2. MARKOV TỪ 17K
   if (trainedModel.trained) {
     for (let order = 1; order <= 9; order++) {
       const p = predictMarkovFromModel(results, order);
@@ -804,7 +806,7 @@ function calculateAdvancedPrediction(data, type) {
     }
   }
   
-  // ===== 3. FREQUENCY =====
+  // 3. FREQUENCY
   [10, 20, 50, 100].forEach(w => {
     if (results.length >= w) {
       const win = results.slice(0, w);
@@ -818,7 +820,7 @@ function calculateAdvancedPrediction(data, type) {
     }
   });
   
-  // ===== 4. CÁC PATTERN CƠ BẢN =====
+  // 4. CÁC PATTERN CƠ BẢN
   const analyzers = [
     analyzeTongPhanTich(last50, type),
     analyzeXuHuongManh(results, type),
@@ -853,7 +855,6 @@ function calculateAdvancedPrediction(data, type) {
     }
   });
   
-  // Distribution
   const dist = analyzeDistribution(last50, type);
   if (dist.imbalance > 0.15) {
     const minority = dist.taiPercent < 50 ? 'Tài' : 'Xỉu';
@@ -861,7 +862,6 @@ function calculateAdvancedPrediction(data, type) {
     factors.push(`Phân bố (T:${dist.taiPercent.toFixed(0)}% X:${dist.xiuPercent.toFixed(0)}%)`);
   }
   
-  // Fallback
   if (predictions.length === 0) {
     const f = analyzeCauTuNhien(results, type);
     predictions.push({ prediction: f.prediction, confidence: f.confidence, priority: 1, name: f.name });
@@ -934,7 +934,9 @@ function getAdaptiveConfidenceBoost(type) {
   if (acc < 0.30) return -10;
   if (acc < 0.40) return -6;
   return 0;
-}// ==================== API DATA FETCH ====================
+}
+
+// ==================== API DATA FETCH ====================
 function transformApiData(apiData) {
   if (!apiData || !apiData.list || !Array.isArray(apiData.list)) return null;
   return apiData.list.map(item => ({
@@ -963,23 +965,35 @@ function updatePattern10(type, data) {
   return lastPattern10[type].join('');
 }
 
-// ==================== DUDOAN HISTORY ====================
+// ==================== DUDOAN HISTORY (ĐÃ FIX CHUẨN 100%) ====================
 function saveDudoanRecord(type, phienTruoc, resultTruoc, phienNay, duDoan, doTinCay) {
   const prev = dudoanHistory[type];
   let trangThai = '';
+  
+  // TÌM ĐÚNG DỰ ĐOÁN CỦA PHIÊN TRƯỚC ĐỂ SO SÁNH (FIX LỖI LAG)
   if (prev.length > 0) {
-    const last = prev[0];
-    trangThai = last.result === last.Du_doan ? 'AUDU LẠI BÚ✅' : 'DITMEMAY LẠI GÃY❌';
+    const lastRecord = prev.find(r => r.Phien_nay.toString() === phienTruoc.toString());
+    if (lastRecord) {
+      // So sánh chuẩn: Kết quả phiên trước so với Dự đoán phiên trước
+      trangThai = lastRecord.Du_doan === resultTruoc ? 'AUDU LẠI BÚ✅' : 'DITMEMAY LẠI GÃY❌';
+      // Cập nhật lại trạng thái cho record cũ ngay lập tức
+      lastRecord.Trang_thai = trangThai;
+    }
   }
+  
   const rec = {
-    phien_truoc: phienTruoc, result: resultTruoc,
-    Phien_nay: phienNay, Du_doan: duDoan,
-    Do_tin_cay: doTinCay, Trang_thai: trangThai,
+    phien_truoc: phienTruoc, 
+    result: resultTruoc,
+    Phien_nay: phienNay, 
+    Du_doan: duDoan,
+    Do_tin_cay: doTinCay, 
+    Trang_thai: '', // Trạng thái này sẽ được điền khi phiên này có kết quả
     timestamp: new Date().toISOString()
   };
+  
   dudoanHistory[type].unshift(rec);
   if (dudoanHistory[type].length > MAX_DUDOAN_HISTORY) {
-    dudoanHistory[type] = dudoanHistory[type].slice(0, MAX_DUDOAN_HISTORY);
+    dudoanHistory[type].pop();
   }
   return rec;
 }
@@ -1216,10 +1230,21 @@ app.get('/api/tx/md5', async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: 'Lỗi server' }); }
 });
 
+// ĐÃ FIX LỖI HIỂN THỊ LỊCH SỬ ĐÚNG/SAI
 app.get('/api/history/dudoan', async (req, res) => {
   try {
     const type = req.query.type || 'hu';
     if (!dudoanHistory[type]) dudoanHistory[type] = [];
+    
+    // Tự động quét và cập nhật lại trạng thái ĐÚNG/SAI cho toàn bộ lịch sử (sửa lỗi cũ nếu có)
+    for (let i = 0; i < dudoanHistory[type].length - 1; i++) {
+        let current = dudoanHistory[type][i];
+        let next = dudoanHistory[type][i + 1];
+        if (current.phien_truoc === next.Phien_nay) {
+            current.Trang_thai = current.Du_doan === current.result ? 'AUDU LẠI BÚ✅' : 'DITMEMAY LẠI GÃY❌';
+        }
+    }
+    
     res.json({
       type: type === 'hu' ? 'Tài Xỉu Hũ' : 'Tài Xỉu MD5',
       total: dudoanHistory[type].length,
@@ -1342,10 +1367,8 @@ app.get('/reset-learning', (req, res) => {
 loadLearningData();
 loadPredictionHistory();
 
-// Load trained model hoặc train from CSV
 if (loadTrainedModel()) {
   console.log('✅ Sử dụng model đã train');
-  // Đảm bảo nạp 10k cầu và công thức nếu thiếu
   if (!trainedModel.patternDict || Object.keys(trainedModel.patternDict).length === 0) {
     loadPatternCau().then(() => loadFormulaCau());
   }
