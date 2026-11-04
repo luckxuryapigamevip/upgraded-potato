@@ -3,9 +3,14 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
+const cors = require('cors'); // Thêm CORS để App gọi được
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+
+// Cấu hình CORS cho App
+app.use(cors());
+app.use(express.json());
 
 // ==================== CONFIG ====================
 const API_URL_HU = 'https://wtx.tele68.com/v1/tx/sessions';
@@ -771,7 +776,7 @@ function analyzeDistribution(data, type, windowSize = 50) {
   };
 }
 
-// ==================== MAIN PREDICTION (ĐÃ FIX LOGIC) ====================
+// ==================== MAIN PREDICTION (ĐÃ FIX LOGIC TÍNH TOÁN) ====================
 function calculateAdvancedPrediction(data, type) {
   const last50 = data.slice(0, 50);
   const results = last50.map(d => d.Ket_qua);
@@ -784,7 +789,7 @@ function calculateAdvancedPrediction(data, type) {
   if (pd) {
     return {
       prediction: pd.prediction,
-      confidence: 85, // Cố định 85% nếu khớp 10k cầu
+      confidence: 85,
       factors: [`[10K CẦU] ${pd.name}`],
       allPatterns: [pd],
       detailedAnalysis: { totalPatterns: 1, topPattern: pd.name, trained: trainedModel.trained }
@@ -807,7 +812,7 @@ function calculateAdvancedPrediction(data, type) {
     }
   }
   
-  // 3. NẾU KHÔNG KHỚP CẦU NÀO RÕ RÀNG, DÙNG CÁC PATTERN CƠ BẢN ĐỂ CHẤM ĐIỂM (Giảm trọng số)
+  // 3. NẾU KHÔNG KHỚP CẦU NÀO RÕ RÀNG, DÙNG CÁC PATTERN CƠ BẢN ĐỂ CHẤM ĐIỂM
   const analyzers = [
     { fn: analyzeTongPhanTich(last50, type), priority: 5 },
     { fn: analyzeXuHuongManh(results, type), priority: 4 },
@@ -826,63 +831,37 @@ function calculateAdvancedPrediction(data, type) {
       if (item.fn.prediction === 'Tài') taiScore += score;
       else xiuScore += score;
       
-      predictions.push({ 
-        prediction: item.fn.prediction, 
-        confidence: item.fn.confidence, 
-        name: item.fn.name 
-      });
+      predictions.push({ prediction: item.fn.prediction, confidence: item.fn.confidence, name: item.fn.name });
       factors.push(item.fn.name);
     }
   });
   
-  // Nếu không có tín hiệu nào, theo số đông 10 phiên gần nhất
+  // Nếu không có tín hiệu nào, đánh theo số đông 10 phiên gần nhất
   if (predictions.length === 0) {
     const tc = results.slice(0, 10).filter(r => r === 'Tài').length;
     const pred = tc >= 5 ? 'Tài' : 'Xỉu';
     return {
-      prediction: pred,
-      confidence: 55,
+      prediction: pred, confidence: 55,
       factors: ['Không có cầu rõ ràng - Đánh theo số đông 10 phiên'],
-      allPatterns: [],
-      detailedAnalysis: { totalPatterns: 0, topPattern: 'N/A', trained: trainedModel.trained }
+      allPatterns: [], detailedAnalysis: { totalPatterns: 0, topPattern: 'N/A', trained: trainedModel.trained }
     };
   }
   
   let finalPrediction = taiScore >= xiuScore ? 'Tài' : 'Xỉu';
-  
-  // Tính độ tự tin thực tế (Không thổi phồng)
   let totalScore = taiScore + xiuScore;
   let winScore = finalPrediction === 'Tài' ? taiScore : xiuScore;
   let winRate = winScore / totalScore; 
   
-  // Công thức tính Conf: Khóa trần ở mức 78% để phản ánh đúng thực tế
+  // Độ tự tin thực tế (Khóa trần 78%, không còn ảo giác 90%)
   let finalConf = Math.round(55 + (winRate * 20)); 
   finalConf = Math.max(55, Math.min(78, finalConf)); 
   
   return {
-    prediction: finalPrediction,
-    confidence: finalConf,
+    prediction: finalPrediction, confidence: finalConf,
     factors: factors.length > 0 ? factors : ['Phân tích tổng hợp'],
     allPatterns: predictions,
-    detailedAnalysis: {
-      totalPatterns: predictions.length,
-      taiScore, xiuScore,
-      topPattern: predictions[0]?.name || 'N/A',
-      trained: trainedModel.trained
-    }
+    detailedAnalysis: { totalPatterns: predictions.length, taiScore, xiuScore, topPattern: predictions[0]?.name || 'N/A', trained: trainedModel.trained }
   };
-}
-
-function getAdaptiveConfidenceBoost(type) {
-  const ra = learningData[type].recentAccuracy;
-  if (ra.length < 10) return 0;
-  const acc = ra.reduce((a, b) => a + b, 0) / ra.length;
-  if (acc > 0.70) return 10;
-  if (acc > 0.60) return 6;
-  if (acc > 0.50) return 3;
-  if (acc < 0.30) return -10;
-  if (acc < 0.40) return -6;
-  return 0;
 }
 
 // ==================== API DATA FETCH ====================
@@ -914,15 +893,15 @@ function updatePattern10(type, data) {
   return lastPattern10[type].join('');
 }
 
-// ==================== DUDOAN HISTORY (ĐÃ FIX LOGIC ĐỒNG BỘ) ====================
+// ==================== DUDOAN HISTORY (ĐÃ FIX CHUẨN XÁC) ====================
 function saveDudoanRecord(type, phienTruoc, resultTruoc, phienNay, duDoan, doTinCay) {
   const rec = {
     phien_truoc: phienTruoc, 
-    result: resultTruoc, // Kết quả của phiên vừa xổ
+    result: resultTruoc, 
     Phien_nay: phienNay, 
-    Du_doan: duDoan, // Dự đoán cho phiên NÀY
+    Du_doan: duDoan, 
     Do_tin_cay: doTinCay, 
-    Trang_thai: '', // Trạng thái này sẽ được điền khi phiên này có kết quả
+    Trang_thai: '', 
     timestamp: new Date().toISOString()
   };
   
@@ -1073,7 +1052,6 @@ async function autoProcessPredictions() {
       const nextPhien = dataMd5[0].Phien + 1;
       if (lastProcessedPhien.md5 !== nextPhien) {
         
-        // Cập nhật trạng thái cho dự đoán của phiên TRƯỚC ĐÓ (Nếu có)
         if (dudoanHistory.md5.length > 0) {
            const lastRecord = dudoanHistory.md5[0];
            if (lastRecord.Phien_nay === dataMd5[0].Phien.toString() && lastRecord.Trang_thai === '') {
@@ -1107,10 +1085,10 @@ function startAutoSaveTask() {
 // ==================== ENDPOINTS ====================
 app.get('/', (req, res) => {
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-  res.send(`🔥 Tài Xỉu VIP PRO ULTRA MAX 6.0 - 17K + 10K CAU (BẢN FIX)
+  res.send(`🔥 Tài Xỉu VIP PRO ULTRA MAX 6.0 - 17K + 10K CAU (BẢN FIX APP)
 📡 Endpoints:
-  GET /api/tx              - Dự đoán Hũ (pattern_10)
-  GET /api/tx/md5          - Dự đoán MD5 (pattern_10)
+  GET /api/tx              - Dự đoán Hũ
+  GET /api/tx/md5          - Dự đoán MD5
   GET /api/history/dudoan  - 1000 phiên đúng/sai
   GET /api/history         - Lịch sử chi tiết
   GET /api/analysis        - Phân tích chi tiết
@@ -1132,7 +1110,6 @@ app.get('/api/tx', async (req, res) => {
     const data = await fetchDataHu();
     if (!data || data.length === 0) return res.status(500).json({ error: 'Không lấy được dữ liệu' });
     
-    // Cập nhật trạng thái cho dự đoán của phiên TRƯỚC ĐÓ (Nếu có)
     if (dudoanHistory.hu.length > 0) {
        const lastRecord = dudoanHistory.hu[0];
        if (lastRecord.Phien_nay === data[0].Phien.toString() && lastRecord.Trang_thai === '') {
@@ -1171,7 +1148,6 @@ app.get('/api/tx/md5', async (req, res) => {
     const data = await fetchDataMd5();
     if (!data || data.length === 0) return res.status(500).json({ error: 'Không lấy được dữ liệu' });
     
-    // Cập nhật trạng thái cho dự đoán của phiên TRƯỚC ĐÓ (Nếu có)
     if (dudoanHistory.md5.length > 0) {
        const lastRecord = dudoanHistory.md5[0];
        if (lastRecord.Phien_nay === data[0].Phien.toString() && lastRecord.Trang_thai === '') {
@@ -1210,7 +1186,6 @@ app.get('/api/history/dudoan', async (req, res) => {
     const type = req.query.type || 'hu';
     if (!dudoanHistory[type]) dudoanHistory[type] = [];
     
-    // Tự động quét và cập nhật lại trạng thái ĐÚNG/SAI cho toàn bộ lịch sử
     for (let i = 0; i < dudoanHistory[type].length - 1; i++) {
         let current = dudoanHistory[type][i];
         let next = dudoanHistory[type][i + 1];
@@ -1361,7 +1336,7 @@ if (loadTrainedModel()) {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🚀 Server: http://0.0.0.0:${PORT}`);
-  console.log('🔥 Tài Xỉu VIP PRO ULTRA MAX 6.0 - 17K + 10K CẦU (BẢN FIX)');
+  console.log('🔥 Tài Xỉu VIP PRO ULTRA MAX 6.0 - 17K + 10K CẦU (BẢN FIX APP)');
   console.log('');
   console.log('📡 ENDPOINTS:');
   console.log('  GET /api/tx              - Dự đoán Hũ (có pattern_10)');
